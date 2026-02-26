@@ -67,8 +67,10 @@ class AntiSpoofingApp(ctk.CTk):
             "lip_dists": [],
             "jaw_dists": [],
             "nose_positions": [],
+            "forehead_positions": [],
             "bg_motion_vectors": [],
             "nose_motion_vectors": [],
+            "forehead_motion_vectors": [],
             "mission_metrics": []
         }
         self.old_gray = None
@@ -218,6 +220,12 @@ class AntiSpoofingApp(ctk.CTk):
                     cv2.polylines(display_frame, [pts], False, (0, 0, 255), 2)
                     cv2.circle(display_frame, self.nose_trail[-1], 5, (0, 0, 255), -1)
 
+                # Draw forehead dot (blue) for display detection debug
+                if len(self.collected_data["forehead_positions"]) > 0:
+                    fh = self.collected_data["forehead_positions"][-1]
+                    cv2.circle(display_frame, fh, 6, (255, 0, 0), -1)
+                    cv2.putText(display_frame, "FH", (fh[0]+8, fh[1]-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 0), 1)
+
                 # Velocity HUD (top-left corner)
                 cv2.rectangle(display_frame, (10, 10), (320, 70), (0, 0, 0), -1)
                 cv2.putText(display_frame, f"Nose Speed: {self.current_nose_speed:.1f} px/f",
@@ -269,6 +277,7 @@ class AntiSpoofingApp(ctk.CTk):
         self.start_button.configure(state="disabled")
         self.status_label.configure(text=f"MISSION: {self.current_challenge}! (3 seconds...)")
         self.result_label.configure(text="Result: Collecting data...")
+        self.test_finished = False
 
         self._collection_loop()
 
@@ -308,6 +317,10 @@ class AntiSpoofingApp(ctk.CTk):
                 self.collected_data["lip_dists"].append(lip_dist)
                 self.collected_data["jaw_dists"].append(jaw_dist)
                 self.collected_data["nose_positions"].append(nose)
+                
+                # Forehead (landmark 10) - stable point for display detection
+                forehead = self._landmark_to_pixel(landmarks[10], w, h)
+                self.collected_data["forehead_positions"].append(forehead)
                 
                 # Active Liveness Mission Metrics
                 if self.current_challenge == "SMILE":
@@ -395,6 +408,14 @@ class AntiSpoofingApp(ctk.CTk):
                     else:
                         self.collected_data["nose_motion_vectors"].append(np.array([0.0, 0.0]))
                         self.current_nose_speed = 0.0
+                    
+                    # Add forehead motion vector (stable during expressions)
+                    if len(self.collected_data["forehead_positions"]) >= 2:
+                        prev_fh = np.array(self.collected_data["forehead_positions"][-2])
+                        curr_fh = np.array(self.collected_data["forehead_positions"][-1])
+                        self.collected_data["forehead_motion_vectors"].append(curr_fh - prev_fh)
+                    else:
+                        self.collected_data["forehead_motion_vectors"].append(np.array([0.0, 0.0]))
 
                     # Speed HUD logic ends here
 
@@ -410,10 +431,10 @@ class AntiSpoofingApp(ctk.CTk):
             self._evaluate_liveness()
 
     def _evaluate_liveness(self):
-        """Gate 1: Analyze the recorded frames against the 3 Defense Engines and the Random Mission.
-        If Gate 1 passes, proceed to Gate 2 & 3 (DeepFace) in a background thread."""
+        """Evaluate Liveness Rules after 3 seconds of data collection."""
+        result = {"gate1_passed": False, "gate2_passed": False, "gate3_passed": False, "error": None}
         data = self.collected_data
-        
+
         if len(data["nose_positions"]) < 10:
             self._finalize_liveness_test("Result: SPOOF DETECTED (Insufficient Data)")
             return
@@ -446,23 +467,30 @@ class AntiSpoofingApp(ctk.CTk):
 
         # -----------------------------------------------------------------
         # Defense 3: Background-Foreground Locking (Defeats Video Replays)
+        # Use FOREHEAD motion (stable during expressions) instead of nose tip
         # -----------------------------------------------------------------
         bg_motions = data["bg_motion_vectors"]
-        nose_motions = data["nose_motion_vectors"]
-        min_len = min(len(bg_motions), len(nose_motions))
+        face_motions = data["forehead_motion_vectors"]  # Forehead = stable reference
+        min_len = min(len(bg_motions), len(face_motions))
         if min_len > 3:
             spoof_frames = 0
             evaluated_frames = 0
             for i in range(min_len):
-                nose_vec = np.array(nose_motions[i])
+                face_vec = np.array(face_motions[i])
                 bg_vec = np.array(bg_motions[i])
-                face_mag = float(np.linalg.norm(nose_vec))
+                face_mag = float(np.linalg.norm(face_vec))
+                bg_mag = float(np.linalg.norm(bg_vec))
                 if face_mag > 1.0:
                     evaluated_frames += 1
-                    diff = float(np.linalg.norm(nose_vec - bg_vec))
-                    if diff < 1.5:
+                    
+                    dot_product = np.dot(face_vec, bg_vec)
+                    cos_sim = dot_product / (face_mag * bg_mag) if (face_mag * bg_mag) != 0 else 0
+                    mag_ratio = min(face_mag, bg_mag) / max(face_mag, bg_mag) if max(face_mag, bg_mag) > 0 else 0
+                    
+                    if cos_sim > 0.80 and mag_ratio > 0.7:
                         spoof_frames += 1
-            if evaluated_frames > 3 and (spoof_frames / evaluated_frames) > 0.4:
+                        
+            if evaluated_frames > 3 and (spoof_frames / evaluated_frames) > 0.35:
                 self._finalize_liveness_test(
                     f"Result: SPOOF DETECTED (Background Locked - {spoof_frames}/{evaluated_frames} frames)"
                 )
@@ -478,22 +506,23 @@ class AntiSpoofingApp(ctk.CTk):
             if self.current_challenge == "SMILE":
                 if np.max(metrics) > initial * 1.2:
                     mission_passed = True
-            elif self.current_challenge == "OPEN MOUTH":
-                if np.max(metrics) > initial + 15:
+            elif self.current_challenge == "TURN HEAD RIGHT":
+                if np.max(metrics) > initial + 0.15: 
                     mission_passed = True
-        if not mission_passed:
-            self._finalize_liveness_test("Result: SPOOF DETECTED (Mission Failed)")
-            return
+            elif self.current_challenge == "OPEN MOUTH":
+                if np.max(metrics) > initial * 1.5:
+                    mission_passed = True
 
-        # -----------------------------------------------------------------
-        # Gate 1 PASSED -> Proceed to Gate 2 & 3 (DeepFace CNN) in a thread.
-        # -----------------------------------------------------------------
-        self.status_label.configure(text="Status: Processing CNN... (Identity Check)")
-        self.result_label.configure(text="Result: Liveness OK. Verifying identity...")
-        self._verification_result = None
-        thread = threading.Thread(target=self._run_deepface_verification, daemon=True)
-        thread.start()
-        self._poll_verification_result()
+        if mission_passed:
+            # Gate 1 PASSED -> Proceed to Gate 2 & 3 (DeepFace CNN) in a thread.
+            self.status_label.configure(text="Status: Processing CNN... (Identity Check)")
+            self.result_label.configure(text="Result: Liveness OK. Verifying identity...")
+            self._verification_result = None
+            thread = threading.Thread(target=self._run_deepface_verification, daemon=True)
+            thread.start()
+            self._poll_verification_result()
+        else:
+            self._finalize_liveness_test("Result: SPOOF DETECTED (Mission Failed)")
 
     def _run_deepface_verification(self):
         """Gate 2 & 3: Run DeepFace verification in a background thread.
@@ -514,7 +543,8 @@ class AntiSpoofingApp(ctk.CTk):
                 consistency = DeepFace.verify(
                     start_rgb, action_rgb,
                     model_name="ArcFace",
-                    detector_backend="opencv"
+                    detector_backend="opencv",
+                    enforce_detection=False
                 )
                 print(f"[TIMING] Gate 2 (consistency): {time.monotonic() - t0:.2f}s")
                 result["gate2_passed"] = consistency.get("verified", False)
@@ -626,8 +656,13 @@ class AntiSpoofingApp(ctk.CTk):
 
     def _finalize_liveness_test(self, result_text):
         """End the challenge phase and display result."""
+        if getattr(self, "test_finished", False):
+            print(f"[DEBUG] _finalize_liveness_test BLOCKED (Test already finished): {result_text}")
+            return
+            
         print(f"[DEBUG] _finalize_liveness_test: {result_text}")
         self.recording_active = False
+        self.test_finished = True
         self.start_button.configure(state="normal")
         self.status_label.configure(text="Status: Test complete.")
         self.result_label.configure(text=result_text)
