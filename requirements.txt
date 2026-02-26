@@ -1,0 +1,7 @@
+customtkinter
+opencv-python
+Pillow
+mediapipe
+numpy
+deepface
+tf-keras
